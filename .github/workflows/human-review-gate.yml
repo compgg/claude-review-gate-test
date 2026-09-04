@@ -7,37 +7,44 @@ on:
 
 permissions:
   pull-requests: read
+  statuses: write
 
 concurrency:
   group: gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  human-review-gate:
+  evaluate:
     runs-on: ubuntu-latest
     steps:
-      - name: Evaluate
+      - name: Evaluate and report
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           REQUIRED_HUMAN_APPROVALS: 1
         run: |
           if [ "$AUTHOR_TYPE" != "Bot" ]; then
-            echo "PR author '$AUTHOR' is a human — gate passes with no extra requirement."
-            exit 0
+            state=success
+            desc="Author '$AUTHOR' is human — no extra requirement."
+          else
+            approvals=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '
+              [ .[]
+                | select(.user.type != "Bot")
+                | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+              ]
+              | group_by(.user.login) | map(last)
+              | map(select(.state == "APPROVED")) | length')
+            if [ "$approvals" -ge "$REQUIRED_HUMAN_APPROVALS" ]; then
+              state=success
+              desc="Bot author '$AUTHOR': $approvals/$REQUIRED_HUMAN_APPROVALS human approvals."
+            else
+              state=failure
+              desc="Bot author '$AUTHOR': $approvals/$REQUIRED_HUMAN_APPROVALS human approvals — needs more."
+            fi
           fi
-          approvals=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate --jq '
-            [ .[]
-              | select(.user.type != "Bot")
-              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
-            ]
-            | group_by(.user.login) | map(last)
-            | map(select(.state == "APPROVED")) | length')
-          echo "PR author '$AUTHOR' is a bot — $approvals human approval(s) found, $REQUIRED_HUMAN_APPROVALS required."
-          if [ "$approvals" -lt "$REQUIRED_HUMAN_APPROVALS" ]; then
-            echo "Gate FAILS until enough humans approve."
-            exit 1
-          fi
-          echo "Gate passes."
+          echo "$desc"
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context=human-review-gate -f description="$desc" > /dev/null
